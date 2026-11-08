@@ -148,7 +148,7 @@ export default function Dashboard() {
             onChange={(event) => setUrl(event.target.value)} required disabled={busy} />
           <button disabled={busy}>Добавить из облака</button>
         </div>
-        <p className="muted">Публичная ссылка Яндекс Диска · MP4 или WebM · до 150 МиБ</p>
+        <p className="muted">Публичная ссылка Яндекс Диска или Google Drive · MP4 или WebM · до 150 МиБ</p>
       </form>
       <div className="upload">
         <label className="file-label">Загрузить с компьютера

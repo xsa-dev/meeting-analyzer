@@ -8,8 +8,9 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, closing, contextmanager
+from email.message import Message
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
 from uuid import uuid4
 
 import httpx
@@ -89,9 +90,18 @@ def public_link(url):
                 and parts.path.startswith("/i/") and token and len(token) <= 200
                 and all(c.isascii() and (c.isalnum() or c in "-_") for c in token)):
             return f"https://disk.yandex.ru/i/{token}"
+        segments = parts.path.strip("/").split("/")
+        if (parts.scheme == "https" and parts.netloc.lower() == "drive.google.com"
+                and len(segments) in (3, 4) and segments[:2] == ["file", "d"]
+                and (len(segments) == 3 or segments[3] in {"view", "preview"})):
+            file_id = segments[2]
+            if 1 <= len(file_id) <= 200 and all(
+                c.isascii() and (c.isalnum() or c in "-_") for c in file_id
+            ):
+                return f"https://drive.google.com/file/d/{file_id}/view"
     except ValueError:
         pass
-    raise HTTPException(422, "Вставьте публичную ссылку на файл Яндекс Диска вида https://disk.yandex.ru/i/…")
+    raise HTTPException(422, "Вставьте публичную ссылку на файл Яндекс Диска или Google Drive.")
 
 
 def validate_name(name):
@@ -99,7 +109,57 @@ def validate_name(name):
         raise ValueError("Поддерживаются только видео MP4 и WebM.")
 
 
+def stream_video(client, url, path, allowed_host, on_response=None):
+    for _ in range(5):
+        parts = urlsplit(url)
+        if (parts.scheme != "https" or parts.username or parts.password
+                or parts.port not in (None, 443) or not allowed_host(parts.hostname or "")):
+            break
+        with client.stream("GET", url) as response:
+            if response.is_redirect:
+                url = urljoin(url, response.headers["location"])
+                continue
+            response.raise_for_status()
+            if on_response:
+                on_response(response)
+            with path.open("wb") as output:
+                size = 0
+                for chunk in response.iter_bytes(65536):
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise ValueError("Видео превышает лимит 150 МиБ.")
+                    output.write(chunk)
+            return
+    raise ValueError("Хранилище вернуло недоступную ссылку на скачивание.")
+
+
+def download_google(link, path, id):
+    file_id = urlsplit(link).path.split("/")[3]
+    query = urlencode({"export": "download", "id": file_id})
+
+    def read_name(response):
+        if response.headers.get("content-type", "").startswith("text/html"):
+            raise ValueError("Google Drive не выдал файл. Проверьте доступ по ссылке и разрешение на скачивание.")
+        disposition = Message()
+        disposition["Content-Disposition"] = response.headers.get("content-disposition", "")
+        name = disposition.get_filename() or ""
+        validate_name(name)
+        update(id, name=Path(name).name)
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            stream_video(
+                client, f"https://drive.google.com/uc?{query}", path,
+                lambda host: host in {"drive.google.com", "drive.usercontent.google.com"}
+                or host.endswith(".googleusercontent.com"), read_name,
+            )
+    except (httpx.HTTPError, KeyError) as exc:
+        raise ValueError("Не удалось скачать запись из Google Drive. Проверьте доступ или загрузите файл с компьютера.") from exc
+
+
 def download(link, path, id):
+    if urlsplit(link).hostname == "drive.google.com":
+        return download_google(link, path, id)
     inaccessible = "Не удалось скачать запись с Яндекс Диска. Проверьте доступ по ссылке или загрузите файл с компьютера."
     try:
         with httpx.Client(timeout=30) as client:
@@ -116,26 +176,13 @@ def download(link, path, id):
             response = client.get(f"{base}/download", params=params)
             response.raise_for_status()
             url = response.json()["href"]
-            for _ in range(5):
-                parts = urlsplit(url)
-                host = parts.hostname or ""
-                if (parts.scheme != "https" or parts.username or parts.password
-                        or parts.port not in (None, 443)
-                        or not (host.endswith(".yandex.net") or host.endswith(".yandex.ru"))):
-                    break
-                with client.stream("GET", url) as response:
-                    if response.is_redirect:
-                        url = urljoin(url, response.headers["location"])
-                        continue
-                    response.raise_for_status()
-                    with path.open("wb") as output:
-                        size = 0
-                        for chunk in response.iter_bytes(65536):
-                            size += len(chunk)
-                            if size > MAX_BYTES:
-                                raise ValueError("Видео превышает лимит 150 МиБ.")
-                            output.write(chunk)
-                    return
+            return stream_video(client, url, path, lambda host: host.endswith((".yandex.net", ".yandex.ru")))
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise ValueError(
+                "Яндекс Диск временно ограничил скачивание (429). "
+                "Попробуйте позже или скачайте видео в браузере и загрузите его с компьютера."
+            ) from exc
     except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError):
         pass
     raise ValueError(inaccessible)
@@ -284,7 +331,7 @@ def insert(id, name, source, link=None):
 async def cloud(body: CloudInput):
     link = public_link(body.url)
     id = uuid4().hex
-    actual_id = insert(id, "Запись с Яндекс Диска", "cloud", link)
+    actual_id = insert(id, "Запись из облака", "cloud", link)
     if actual_id == id:
         app.state.worker.submit(process, id, link)
     return {"id": actual_id}
