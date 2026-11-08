@@ -14,10 +14,15 @@ const stages = {
 const active = ["fetching", "transcribing", "analyzing"];
 
 async function request(path, options) {
-  const response = await fetch(API + path, { cache: "no-store", ...options });
+  const accessKey = sessionStorage.getItem("meeting-access-key");
+  const headers = new Headers(options?.headers);
+  if (accessKey) headers.set("X-Meeting-Key", accessKey);
+  const response = await fetch(API + path, { cache: "no-store", ...options, headers });
   const result = await response.json();
   if (!response.ok) {
-    throw new Error(typeof result.detail === "string" ? result.detail : "Проверьте введённые данные.");
+    const error = new Error(typeof result.detail === "string" ? result.detail : "Проверьте введённые данные.");
+    error.status = response.status;
+    throw error;
   }
   return result;
 }
@@ -28,6 +33,8 @@ function readableError(error) {
 
 export default function Dashboard() {
   const [rows, setRows] = useState([]);
+  const [needsKey, setNeedsKey] = useState(false);
+  const [key, setKey] = useState("");
   const [selected, select] = useState(null);
   const [detail, setDetail] = useState(null);
   const [url, setUrl] = useState("");
@@ -46,10 +53,14 @@ export default function Dashboard() {
         const data = await request("/meetings");
         if (live) {
           setRows(data);
+          setNeedsKey(false);
           setListError("");
         }
       } catch (error) {
-        if (live) setListError(readableError(error));
+        if (live) {
+          setNeedsKey(error.status === 401);
+          setListError(readableError(error));
+        }
       } finally {
         if (live) timer = setTimeout(poll, 2000);
       }
@@ -114,6 +125,21 @@ export default function Dashboard() {
       <p className="intro">Добавьте видеозапись, чтобы получить расшифровку и конспект встречи.</p>
     </header>
 
+    {needsKey ? <section className="panel">
+      <form onSubmit={(event) => {
+        event.preventDefault();
+        sessionStorage.setItem("meeting-access-key", key.trim());
+        setKey("");
+        setRefresh((value) => value + 1);
+      }}>
+        <label htmlFor="access">Код доступа</label>
+        <div className="actions">
+          <input id="access" type="password" value={key} required onChange={(event) => setKey(event.target.value)} />
+          <button>Открыть анализатор</button>
+        </div>
+        <p role="status" className="muted">{listError}</p>
+      </form>
+    </section> : <>
     <section className="panel import">
       <form onSubmit={addCloud}>
         <label htmlFor="cloud">Ссылка на видеозапись</label>
@@ -173,5 +199,6 @@ export default function Dashboard() {
         </div>}
       </section>
     </div>
+    </>}
   </main>;
 }

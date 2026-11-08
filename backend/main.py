@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from uuid import uuid4
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -59,9 +61,19 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+@app.middleware("http")
+async def check_access(request, call_next):
+    key = os.getenv("MEETING_ACCESS_KEY", "")
+    if key and request.method != "OPTIONS":
+        supplied = request.headers.get("X-Meeting-Key", "")
+        if not hmac.compare_digest(supplied.encode(), key.encode()):
+            return JSONResponse({"detail": "Введите код доступа к анализатору."}, status_code=401)
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware, allow_origins=os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(","),
-    allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-Filename"],
+    allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-Filename", "X-Meeting-Key"],
 )
 
 
